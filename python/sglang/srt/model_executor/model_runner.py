@@ -2282,17 +2282,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if tq_cfg is None:
             return
 
+        import re as _re
         import logging
         logger = logging.getLogger(__name__)
+        skip_layers = getattr(kvcache, "skip_layers", set())
         logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
         fused = 0
         skipped_fp8 = False
-        for _, mod in self.model.named_modules():
+        skipped_skip_layer = 0
+        for name, mod in self.model.named_modules():
             if hasattr(mod, "o_proj") and hasattr(mod.o_proj, "weight"):
+                if skip_layers:
+                    layer_match = _re.search(r"layers\.(\d+)", name)
+                    if layer_match and int(layer_match.group(1)) in skip_layers:
+                        skipped_skip_layer += 1
+                        continue
                 w = mod.o_proj.weight
-                # FP8 quantized weights have associated scale factors.
-                # Fusing rotation would corrupt the weight-scale relationship.
-                # Skip fusion and use runtime inverse rotation instead.
                 if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                     skipped_fp8 = True
                     continue
@@ -2311,6 +2316,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif fused > 0:
             tq_cfg.output_rotation_fused = True
             logger.info("TurboQuant: fused inverse rotation into %d o_proj layers", fused)
+        if skipped_skip_layer > 0:
+            logger.info(
+                "TurboQuant: skipped rotation fusion for %d skip-layers (bf16 KV)",
+                skipped_skip_layer,
+            )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

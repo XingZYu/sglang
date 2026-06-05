@@ -805,6 +805,7 @@ class ModelRunnerKVCacheMixin:
                         turboquant_uniform=getattr(self, "turboquant_uniform", False),
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
+                        skip_layers=self.server_args.turboquant_skip_layers,
                     )
                 elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(

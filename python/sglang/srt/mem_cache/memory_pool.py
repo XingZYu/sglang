@@ -1257,8 +1257,10 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        skip_layers: Optional[List[int]] = None,
     ):
         self.turboquant_bits = turboquant_bits
+        self.skip_layers: set = set(skip_layers) if skip_layers else set()
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 
         k_bits = turboquant_k_bits or turboquant_bits
@@ -1286,6 +1288,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             enable_alt_stream=False,
             enable_kv_cache_copy=False,
         )
+        if self.skip_layers:
+            logger.info(
+                "TurboQuant: skip-layers %s will use bf16 KV (no quantization/rotation)",
+                sorted(self.skip_layers),
+            )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1295,6 +1302,26 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 else nullcontext()
             ):
                 m = self.size + self.page_size
+
+                # Adjust pool size if skip-layers need bf16 buffers
+                n_skip = sum(1 for i in range(self.layer_num)
+                             if (i + self.start_layer) in self.skip_layers)
+                if n_skip > 0:
+                    n_quant = self.layer_num - n_skip
+                    tq_per_token = (
+                        self.head_num * (self.tq_config.k_packed_dim + self.tq_config.v_packed_dim)
+                        + self.head_num * 4 * 2  # k_dscale + v_dscale (fp32)
+                    )
+                    skip_per_token = self.head_num * self.head_dim * 2 * 2  # K+V bf16
+                    original_total = tq_per_token * self.layer_num
+                    adjusted_total = tq_per_token * n_quant + skip_per_token * n_skip
+                    if adjusted_total > 0:
+                        m = int(m * original_total / adjusted_total)
+                    logger.info(
+                        "TurboQuant skip-layers: adjusted pool size %d → %d "
+                        "(%d TQ layers + %d skip layers)",
+                        self.size + self.page_size, m, n_quant, n_skip,
+                    )
 
                 # Packed quantized indices (K and V may have different dim/dtype)
                 self.k_buffer = [
@@ -1332,6 +1359,22 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                     )
                     for _ in range(self.layer_num)
                 ]
+
+                # bf16 shadow buffers for skip-layers
+                if self.skip_layers:
+                    self._skip_k_buffer = [None] * self.layer_num
+                    self._skip_v_buffer = [None] * self.layer_num
+                    for i in range(self.layer_num):
+                        layer_id = i + self.start_layer
+                        if layer_id in self.skip_layers:
+                            self._skip_k_buffer[i] = torch.zeros(
+                                (m, self.head_num, self.head_dim),
+                                dtype=torch.bfloat16, device=self.device,
+                            )
+                            self._skip_v_buffer[i] = torch.zeros(
+                                (m, self.head_num, self.head_dim),
+                                dtype=torch.bfloat16, device=self.device,
+                            )
 
                 # Pre-allocated buffers for quantize path (avoids torch.empty inside CUDA graph)
                 max_bs = 256  # matches cuda_graph_max_bs default
@@ -1390,6 +1433,16 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             layer_id = layer.layer_id
         idx = layer_id - self.start_layer
 
+        # Skip-layer: store bf16 directly (no rotation, no quantization)
+        if layer_id in self.skip_layers:
+            self._skip_k_buffer[idx][loc] = cache_k.reshape(
+                loc.shape[0], self.head_num, self.head_dim
+            )
+            self._skip_v_buffer[idx][loc] = cache_v.reshape(
+                loc.shape[0], self.head_num, self.head_dim
+            )
+            return
+
         cfg = self.tq_config
 
         # Quantize K+V with batched norm+WHT, using pre-allocated buffers
@@ -1406,12 +1459,16 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         )
 
     def _get_key_buffer(self, layer_id: int):
+        if layer_id in self.skip_layers:
+            return self._skip_k_buffer[layer_id - self.start_layer]
         raise NotImplementedError(
             "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
             "Dequant buffer path not supported."
         )
 
     def _get_value_buffer(self, layer_id: int):
+        if layer_id in self.skip_layers:
+            return self._skip_v_buffer[layer_id - self.start_layer]
         raise NotImplementedError(
             "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
             "Dequant buffer path not supported."
@@ -1422,17 +1479,26 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         for i in range(self.layer_num):
-            self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
-            self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
-            self.k_dequant_scale_buffer[i][tgt_loc] = self.k_dequant_scale_buffer[i][src_loc]
-            self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
+            layer_id = i + self.start_layer
+            if layer_id in self.skip_layers:
+                self._skip_k_buffer[i][tgt_loc] = self._skip_k_buffer[i][src_loc]
+                self._skip_v_buffer[i][tgt_loc] = self._skip_v_buffer[i][src_loc]
+            else:
+                self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
+                self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
+                self.k_dequant_scale_buffer[i][tgt_loc] = self.k_dequant_scale_buffer[i][src_loc]
+                self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
 
     def get_kv_size_bytes(self):
         """Total GPU memory used by all TurboQuant buffers."""
         total = 0
         for i in range(self.layer_num):
-            total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
-            total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+            layer_id = i + self.start_layer
+            if layer_id in self.skip_layers:
+                total += self._skip_k_buffer[i].nbytes + self._skip_v_buffer[i].nbytes
+            else:
+                total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
+                total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
         return total
 
     def get_tq_buffers(self, layer_id: int):

@@ -337,6 +337,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    turboquant_skip_layers: Optional[List[int]] = None
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -793,6 +794,12 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        # Parse --turboquant-skip-layers from comma-separated string to list of ints.
+        if isinstance(self.turboquant_skip_layers, str):
+            self.turboquant_skip_layers = [
+                int(x.strip()) for x in self.turboquant_skip_layers.split(",") if x.strip()
+            ]
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -4261,6 +4268,15 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1", "turboquant_2bit", "turboquant_4bit", "turboquant_4bit_uniform", "turboquant_k4v2"],
             help='Data type for kv cache storage. "auto" will use model data type. "turboquant_Xbit" for codebook quantization, "turboquant_Xbit_uniform" for uniform quantization (faster decode, slightly lower accuracy).',
+        )
+        parser.add_argument(
+            "--turboquant-skip-layers",
+            type=str,
+            default=None,
+            help='Comma-separated layer indices to skip TurboQuant quantization '
+                 '(keep bf16 KV cache). E.g., "0,27" for Qwen2.5-7B first/last layers. '
+                 'Required for Qwen-family models where K-norm outlier layers cause '
+                 'catastrophic accuracy loss at 4-bit quantization.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
