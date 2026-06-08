@@ -1009,16 +1009,16 @@ class TritonAttnBackend(AttentionBackend):
             and kv_indptr is not None):
             # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer
             # Supports symmetric and asymmetric K/V bit widths
-            idx = layer.layer_id - pool.start_layer
+            k_buf, v_buf, k_scale_buf, v_scale_buf = pool.get_tq_buffers(layer.layer_id)
             self.tq_extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 self.forward_metadata.qo_indptr,
@@ -1281,13 +1281,13 @@ class TritonAttnBackend(AttentionBackend):
             # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer
             # Supports symmetric (K=V) and asymmetric (K!=V) bit widths
             pool = forward_batch.token_to_kv_pool
-            idx = layer.layer_id - pool.start_layer
+            k_buf, v_buf, k_scale_buf, v_scale_buf = pool.get_tq_buffers(layer.layer_id)
             self.tq_decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),

@@ -2088,18 +2088,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.turboquant_v_bits = bits
                 self.turboquant_bits = bits
             self.kv_cache_dtype = torch.bfloat16
-            # TurboQuant fused decode kernel is Triton-only.
-            # Only override DECODE backend to triton; prefill keeps default (fa3/flashinfer)
-            # for maximum prefill throughput. Prefill reads from shared dequant buffer (bf16),
-            # which is compatible with any attention backend.
+            # TurboQuant fused kernels (decode + extend) are Triton-only.
+            # For hybrid models, the full_attn_backend is also used for extend,
+            # so we must override the main attention_backend too.
+            if self.server_args.attention_backend != "triton":
+                prev = self.server_args.attention_backend or "default"
+                self.server_args.attention_backend = "triton"
+                logger.info(
+                    f"TurboQuant: overriding attention-backend={prev} → triton "
+                    f"(fused extend+decode kernels require Triton for both paths)."
+                )
             if self.server_args.decode_attention_backend is None or \
                self.server_args.decode_attention_backend != "triton":
-                prev = self.server_args.decode_attention_backend or "default"
                 self.server_args.decode_attention_backend = "triton"
-                logger.info(
-                    f"TurboQuant: overriding decode-attention-backend={prev} → triton "
-                    f"(fused decode kernel). Prefill backend unchanged for optimal throughput."
-                )
             # Fused decode kernel supports symmetric and asymmetric 2-bit and 4-bit.
             has_fused = (
                 self.turboquant_k_bits in (2, 4)

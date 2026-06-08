@@ -733,6 +733,24 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+
+                tq_pool_class = None
+                tq_pool_kwargs = None
+                if hasattr(self, "turboquant_bits"):
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    tq_pool_class = MHATokenToKVPoolTurboQuant
+                    tq_pool_kwargs = {
+                        "turboquant_bits": self.turboquant_bits,
+                        "turboquant_k_bits": getattr(self, "turboquant_k_bits", 0),
+                        "turboquant_v_bits": getattr(self, "turboquant_v_bits", 0),
+                        "turboquant_uniform": getattr(
+                            self, "turboquant_uniform", False
+                        ),
+                    }
+
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -760,6 +778,8 @@ class ModelRunnerKVCacheMixin:
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    token_to_kv_pool_class=tq_pool_class,
+                    token_to_kv_pool_kwargs=tq_pool_kwargs,
                     **extra_args,
                 )
             else:
