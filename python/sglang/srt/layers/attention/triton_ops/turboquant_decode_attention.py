@@ -430,7 +430,12 @@ def _tq_decode_grouped_att_m_fwd(
     BLOCK_N = 16
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_packed.shape[1]
-    BLOCK_H = min(16, kv_group_num)
+    # Triton 要求 tl.arange 的长度必须是 2 的幂。当 kv_group_num 不是 2 的幂时
+    # （例如 Qwen2.5-7B：head=28、kv_head=4 → kv_group_num=7），原始的
+    # `min(16, kv_group_num)` 会让 BLOCK_H=7 触发
+    # `arange's range must be a power of 2` 编译错误。
+    # 上 round 到 2 的幂，kernel 内的 mask_h / VALID_BLOCK_H 已经能正确屏蔽多余的 head slot。
+    BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
 
     grid = (
         batch,
