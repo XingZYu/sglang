@@ -124,6 +124,15 @@ def _fwd_tq_grouped_kernel_stage1(
     V_BIT_MASK: tl.constexpr,       # 0x0F for V=4-bit, 0x03 for V=2-bit
     xai_temperature_len: tl.constexpr,
     UNIFORM: tl.constexpr = False,
+    # --- Fused reduce parameters ---
+    O_Final=None,
+    reduce_lock=None,
+    stride_of_b=0,
+    stride_of_h=0,
+    stride_lock=0,
+    FUSE_REDUCEV: tl.constexpr = False,
+    MAX_KV_SPLITS: tl.constexpr = 1,
+    BLOCK_DV_OUT: tl.constexpr = 128,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -395,6 +404,110 @@ def _fwd_tq_grouped_kernel_stage1(
 
         tl.store(Att_Lse + offs_mid_lse, e_max + tl.log(e_sum), mask=mask_h)
 
+    else:
+        # Empty split: write safe values so fused reduce reads valid data.
+        # Att_Lse = -inf makes exp(-inf - max) = 0, contributing nothing.
+        # Att_Out = 0 ensures no spurious contribution.
+        if FUSE_REDUCEV:
+            base_mid_o = (
+                cur_batch * stride_mid_ob
+                + cur_head[:, None] * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            )
+            offs_dv_safe = tl.arange(0, BLOCK_DV_OUT)
+            mask_dv_safe = offs_dv_safe < Lv
+            tl.store(
+                Att_Out + base_mid_o + offs_dv_safe[None, :],
+                tl.zeros([BLOCK_H, BLOCK_DV_OUT], dtype=tl.float32),
+                mask=mask_h[:, None] & mask_dv_safe[None, :],
+            )
+
+            offs_mid_lse = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // Lv
+            tl.store(
+                Att_Lse + offs_mid_lse,
+                tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf"),
+                mask=mask_h,
+            )
+
+    # --- Fused Reduce V (atomic online reduce) ---
+    # IMPORTANT: This block is OUTSIDE the `if split_kv_end > split_kv_start` guard.
+    # All valid splits (including empty ones) must participate in the atomic
+    # increment so that the counter reaches kv_splits - 1 and triggers reduce.
+    if FUSE_REDUCEV:
+        if split_kv_id < kv_splits:
+            # Memory fence: debug_barrier ensures all stores from this block
+            # are committed to L2 before the atomic increment
+            tl.debug_barrier()
+
+            # Atomic increment: last split to arrive does the reduce
+            lock_offset = cur_batch * stride_lock + cur_head_id
+            old_count = tl.atomic_add(reduce_lock + lock_offset, 1)
+
+            if old_count == kv_splits - 1:
+                # This is the last split — perform online softmax merge
+                r_e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+                r_e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+                r_acc = tl.zeros([BLOCK_H, BLOCK_DV_OUT], dtype=tl.float32)
+
+                offs_dv = tl.arange(0, BLOCK_DV_OUT)
+                mask_dv = offs_dv < Lv
+
+                for s in range(0, MAX_KV_SPLITS):
+                    # Recompute split bounds for split s
+                    s_start = kv_len_per_split * s
+                    s_end = tl.minimum(s_start + kv_len_per_split, cur_batch_seq_len)
+
+                    if s_end > s_start:
+                        # Load att_out for all heads in this group
+                        offs_load = (
+                            cur_batch * stride_mid_ob
+                            + cur_head[:, None] * stride_mid_oh
+                            + s * stride_mid_os
+                            + offs_dv[None, :]
+                        )
+                        tv = tl.load(
+                            Att_Out + offs_load,
+                            mask=mask_h[:, None] & mask_dv[None, :],
+                            other=0.0,
+                        )
+
+                        # Load LSE for all heads in this group
+                        offs_lse_r = (
+                            cur_batch * stride_mid_ob
+                            + cur_head * stride_mid_oh
+                            + s * stride_mid_os
+                        ) // Lv
+                        tlogic = tl.load(
+                            Att_Lse + offs_lse_r,
+                            mask=mask_h,
+                            other=-float("inf"),
+                        )
+
+                        # Online softmax merge
+                        n_e_max = tl.maximum(tlogic, r_e_max)
+                        old_scale = tl.exp(r_e_max - n_e_max)
+                        r_acc *= old_scale[:, None]
+                        exp_logic = tl.exp(tlogic - n_e_max)
+                        r_acc += exp_logic[:, None] * tv
+                        r_e_sum = r_e_sum * old_scale + exp_logic
+                        r_e_max = n_e_max
+
+                # Write final output O_Final[batch, head, dim]
+                offs_final = (
+                    cur_batch * stride_of_b
+                    + cur_head[:, None] * stride_of_h
+                    + offs_dv[None, :]
+                )
+                tl.store(
+                    O_Final + offs_final,
+                    r_acc / r_e_sum[:, None],
+                    mask=mask_h[:, None] & mask_dv[None, :],
+                )
+
 
 def _bit_params(bit_width):
     """Return (VALS_PER_BYTE, BITS_PER_VAL, BIT_MASK) for a given bit width."""
@@ -413,6 +526,9 @@ def _tq_decode_grouped_att_m_fwd(
     k_bit_width, v_bit_width,
     xai_temperature_len=-1,
     uniform=False,
+    o_final=None,
+    reduce_lock=None,
+    fuse_reducev=False,
 ):
     Lk = q.shape[-1]
     Lv = Lk
@@ -437,11 +553,14 @@ def _tq_decode_grouped_att_m_fwd(
     # 上 round 到 2 的幂，kernel 内的 mask_h / VALID_BLOCK_H 已经能正确屏蔽多余的 head slot。
     BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
 
+    num_head_groups = triton.cdiv(head_num, min(BLOCK_H, kv_group_num))
     grid = (
         batch,
-        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        num_head_groups,
         max_kv_splits,
     )
+
+    BLOCK_DV_OUT = triton.next_power_of_2(Lv)
 
     _fwd_tq_grouped_kernel_stage1[grid](
         q, k_packed, v_packed, k_dscale, v_dscale,
@@ -475,6 +594,15 @@ def _tq_decode_grouped_att_m_fwd(
         V_BIT_MASK=V_BIT_MASK,
         xai_temperature_len=xai_temperature_len,
         UNIFORM=uniform,
+        # Fused reduce parameters
+        O_Final=o_final if fuse_reducev else q,  # placeholder when not fusing
+        reduce_lock=reduce_lock if fuse_reducev else kv_indptr,  # placeholder
+        stride_of_b=o_final.stride(0) if fuse_reducev else 0,
+        stride_of_h=o_final.stride(1) if fuse_reducev else 0,
+        stride_lock=num_head_groups,
+        FUSE_REDUCEV=fuse_reducev,
+        MAX_KV_SPLITS=max_kv_splits,
+        BLOCK_DV_OUT=BLOCK_DV_OUT,
     )
 
 
@@ -491,6 +619,8 @@ def tq_decode_attention_fwd(
     Supports asymmetric K/V bit widths (e.g., K=4bit V=2bit).
     Supports 2-bit (4-way split) and 4-bit (2-way split).
     """
+    import torch
+
     from sglang.srt.layers.attention.triton_ops.decode_attention import (
         _decode_softmax_reducev_fwd,
     )
@@ -498,6 +628,23 @@ def tq_decode_attention_fwd(
     assert max_kv_splits == attn_logits.shape[2]
     assert k_bit_width in (2, 4), f"Unsupported K bit_width: {k_bit_width}"
     assert v_bit_width in (2, 4), f"Unsupported V bit_width: {v_bit_width}"
+
+    # Determine whether to fuse reduce into Stage 1
+    FUSE_THRESHOLD = 8
+    fuse_reducev = (max_kv_splits <= FUSE_THRESHOLD) and (sinks is None)
+
+    if fuse_reducev:
+        # Allocate atomic lock buffer: shape (batch * num_head_groups,)
+        batch = q.shape[0]
+        head_num = q.shape[1]
+        kv_group_num = head_num // k_packed.shape[1]
+        BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
+        num_head_groups = triton.cdiv(head_num, min(BLOCK_H, kv_group_num))
+        reduce_lock = torch.zeros(
+            batch * num_head_groups, dtype=torch.int32, device=q.device
+        )
+    else:
+        reduce_lock = None
 
     # Stage 1: fused TQ attention with packed KV
     _tq_decode_grouped_att_m_fwd(
@@ -507,12 +654,16 @@ def tq_decode_attention_fwd(
         k_bit_width, v_bit_width,
         xai_temperature_len=xai_temperature_len,
         uniform=uniform,
+        o_final=o if fuse_reducev else None,
+        reduce_lock=reduce_lock,
+        fuse_reducev=fuse_reducev,
     )
 
-    # Stage 2: reuse standard softmax reduce
-    _decode_softmax_reducev_fwd(
-        attn_logits, attn_lse, q, o,
-        1.0,  # v_scale = 1.0 (dequant scale applied in stage1)
-        o,    # v_buffer: only .shape[-1] used for Lv
-        kv_indptr, num_kv_splits, max_kv_splits, sinks,
-    )
+    # Stage 2: only needed when reduce is NOT fused
+    if not fuse_reducev:
+        _decode_softmax_reducev_fwd(
+            attn_logits, attn_lse, q, o,
+            1.0,  # v_scale = 1.0 (dequant scale applied in stage1)
+            o,    # v_buffer: only .shape[-1] used for Lv
+            kv_indptr, num_kv_splits, max_kv_splits, sinks,
+        )
